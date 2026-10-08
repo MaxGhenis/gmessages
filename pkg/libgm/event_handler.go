@@ -24,6 +24,13 @@ type IncomingRPCMessage struct {
 	Message          *gmproto.RPCMessageData
 	DecryptedData    []byte
 	DecryptedMessage proto.Message
+
+	// Shape summarises a data-route frame's envelope without its content.
+	Shape ResponseShape
+
+	// payloadErr is set on the synthetic message that fails a request whose
+	// only answers carried no response payload.
+	payloadErr error
 }
 
 var responseType = map[gmproto.ActionType]proto.Message{
@@ -111,12 +118,16 @@ func (c *Client) decryptInternalMessage(data *gmproto.IncomingRPCMessage) (*Inco
 			}
 			// Hacky hack to have User.handleAccountChange do the right-ish thing on startup
 			if strings.ContainsRune(ed2c.GetAccountChange().GetAccount(), '@') {
+				msg.Shape.AccountSwitch = true
 				c.triggerEvent(&events.AccountChange{
 					AccountChangeOrSomethingEvent: ed2c.GetAccountChange(),
 					IsFake:                        true,
 				})
 			}
 		}
+		accountSwitch := msg.Shape.AccountSwitch
+		msg.Shape = responseShape(msg)
+		msg.Shape.AccountSwitch = accountSwitch
 	default:
 		return nil, fmt.Errorf("unknown bugle route %d", data.BugleRoute)
 	}

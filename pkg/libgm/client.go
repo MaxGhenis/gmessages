@@ -154,7 +154,7 @@ func NewAuthData() *AuthData {
 
 func NewClient(authData *AuthData, pk *PushKeys, logger zerolog.Logger) *Client {
 	sessionHandler := &SessionHandler{
-		responseWaiters: make(map[string]chan<- *IncomingRPCMessage),
+		responseWaiters: make(map[string]*responseWaiter),
 	}
 	transport := &http.Transport{
 		DialContext:           (&net.Dialer{Timeout: 10 * time.Second}).DialContext,

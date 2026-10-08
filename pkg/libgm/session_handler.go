@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,8 +19,9 @@ import (
 type SessionHandler struct {
 	client *Client
 
-	responseWaiters     map[string]chan<- *IncomingRPCMessage
+	responseWaiters     map[string]*responseWaiter
 	responseWaitersLock sync.Mutex
+	payloadGrace        atomic.Int64 // time.Duration; 0 = DefaultResponsePayloadGrace
 
 	ackMapLock sync.Mutex
 	ackMap     []string
@@ -53,12 +55,17 @@ func (s *SessionHandler) sendMessageNoResponse(params SendMessageParams) error {
 }
 
 func (s *SessionHandler) sendAsyncMessage(params SendMessageParams) (<-chan *IncomingRPCMessage, error) {
+	_, ch, err := s.sendAsyncMessageWithID(params)
+	return ch, err
+}
+
+func (s *SessionHandler) sendAsyncMessageWithID(params SendMessageParams) (string, <-chan *IncomingRPCMessage, error) {
 	requestID, payload, err := s.buildMessage(params)
 	if err != nil {
-		return nil, err
+		return "", nil, err
 	}
 
-	ch := s.waitResponse(requestID)
+	ch := s.waitResponse(requestID, params.Action)
 	url := util.SendMessageURL
 	if s.client.AuthData.HasCookies() {
 		url = util.SendMessageURLGoogle
@@ -72,9 +79,9 @@ func (s *SessionHandler) sendAsyncMessage(params SendMessageParams) (<-chan *Inc
 	)
 	if err != nil {
 		s.cancelResponse(requestID, ch)
-		return nil, err
+		return "", nil, err
 	}
-	return ch, nil
+	return requestID, ch, nil
 }
 
 func typedResponse[T proto.Message](resp *IncomingRPCMessage, err error) (casted T, retErr error) {
@@ -82,33 +89,51 @@ func typedResponse[T proto.Message](resp *IncomingRPCMessage, err error) (casted
 		retErr = err
 		return
 	}
+	if resp == nil {
+		retErr = fmt.Errorf("no response received")
+		return
+	}
+	if resp.payloadErr != nil {
+		retErr = resp.payloadErr
+		return
+	}
 	var ok bool
 	casted, ok = resp.DecryptedMessage.(T)
 	if !ok {
-		retErr = fmt.Errorf("unexpected response type %T for %s, expected %T", resp.DecryptedMessage, resp.ResponseID, casted)
+		retErr = fmt.Errorf("unexpected response type %T for %s, expected %T", resp.DecryptedMessage, resp.GetResponseID(), casted)
 	}
 	return
 }
 
-func (s *SessionHandler) waitResponse(requestID string) chan *IncomingRPCMessage {
+func (s *SessionHandler) waitResponse(requestID string, action gmproto.ActionType) chan *IncomingRPCMessage {
 	ch := make(chan *IncomingRPCMessage, 1)
 	s.responseWaitersLock.Lock()
-	s.responseWaiters[requestID] = ch
+	s.responseWaiters[requestID] = &responseWaiter{ch: ch, action: action, sentAt: time.Now()}
 	s.responseWaitersLock.Unlock()
 	return ch
 }
 
 func (s *SessionHandler) cancelResponse(requestID string, ch chan *IncomingRPCMessage) {
 	s.responseWaitersLock.Lock()
-	close(ch)
+	defer s.responseWaitersLock.Unlock()
+	w, ok := s.responseWaiters[requestID]
+	if !ok || w.ch != ch {
+		// A response (or payload-wait expiry) already claimed the waiter and
+		// owns the single send on ch, so it must not be closed under it.
+		return
+	}
+	if w.graceTimer != nil {
+		w.graceTimer.Stop()
+	}
 	delete(s.responseWaiters, requestID)
-	s.responseWaitersLock.Unlock()
+	close(ch)
 }
 
 func (s *SessionHandler) receiveResponse(msg *IncomingRPCMessage) bool {
 	if msg.Message == nil {
 		return false
 	}
+	requestID := msg.Message.SessionID
 	if s.client.AuthData.HasCookies() {
 		switch msg.Message.Action {
 		case gmproto.ActionType_CREATE_GAIA_PAIRING_CLIENT_INIT, gmproto.ActionType_CREATE_GAIA_PAIRING_CLIENT_FINISHED:
@@ -116,56 +141,124 @@ func (s *SessionHandler) receiveResponse(msg *IncomingRPCMessage) bool {
 			// Very hacky way to ignore weird messages that come before real responses
 			// TODO figure out how to properly handle these
 			if msg.Message.UnencryptedData != nil && msg.Message.EncryptedData == nil {
+				s.responseWaitersLock.Lock()
+				w, pending := s.responseWaiters[requestID]
+				s.responseWaitersLock.Unlock()
+				if pending && payloadRequired[w.action] {
+					s.client.Logger.Info().
+						Str("request_message_id", requestID).
+						Stringer("request_action", w.action).
+						Dur("elapsed", time.Since(w.sentAt)).
+						Object("frame", msg.Shape).
+						Msg("Ignoring unencrypted intermediate frame for pending request")
+				}
 				return false
 			}
 		}
 	}
-	requestID := msg.Message.SessionID
 	s.responseWaitersLock.Lock()
-	ch, ok := s.responseWaiters[requestID]
+	w, ok := s.responseWaiters[requestID]
 	if !ok {
 		s.responseWaitersLock.Unlock()
+		if msg.Message.Action != gmproto.ActionType_GET_UPDATES {
+			// A response nobody is waiting for: a late answer after its request
+			// already completed (or failed), or a duplicate.
+			s.client.Logger.Info().
+				Str("request_message_id", requestID).
+				Str("response_message_id", msg.ResponseID).
+				Object("frame", msg.Shape).
+				Msg("Received response with no pending request")
+		}
 		return false
 	}
-	delete(s.responseWaiters, requestID)
-	s.responseWaitersLock.Unlock()
-	evt := s.client.Logger.Debug().
-		Str("request_message_id", requestID).
-		Str("response_message_id", msg.ResponseID)
-	if msg.Message != nil {
-		evt.Stringer("message_action", msg.Message.Action)
+	if rejectsPayloadless(w.action, msg.Shape) {
+		// The phone answered, but without the encrypted payload that carries
+		// the requested data. Keep waiting for the real response for a bounded
+		// time instead of handing the caller a pre-allocated empty message.
+		w.skipped++
+		w.lastSkipped = msg.Shape
+		w.accountSwitch = w.accountSwitch || msg.Shape.AccountSwitch
+		if w.graceTimer == nil {
+			w.graceTimer = time.AfterFunc(s.responsePayloadGrace(), func() {
+				s.expirePayloadWait(requestID, w)
+			})
+		}
+		skipped := w.skipped
+		s.responseWaitersLock.Unlock()
+		s.client.Logger.Warn().
+			Str("request_message_id", requestID).
+			Str("response_message_id", msg.ResponseID).
+			Stringer("request_action", w.action).
+			Int("payloadless_frames", skipped).
+			Dur("elapsed", time.Since(w.sentAt)).
+			Object("frame", msg.Shape).
+			Msg("Phone answered a pending request without a response payload; waiting for the real response")
+		return true
 	}
+	delete(s.responseWaiters, requestID)
+	if w.graceTimer != nil {
+		w.graceTimer.Stop()
+	}
+	s.responseWaitersLock.Unlock()
+	if msg.Shape.HasPayload && msg.Shape.ContentFree() && payloadRequired[w.action] &&
+		msg.DecryptedMessage != nil && msg.DecryptedMessage.ProtoReflect().Descriptor().Fields().Len() > 0 {
+		// Legitimate for an empty folder, but worth seeing when a pull
+		// unexpectedly comes back empty. Shape only: never payload bytes.
+		s.client.Logger.Info().
+			Str("request_message_id", requestID).
+			Stringer("request_action", w.action).
+			Dur("elapsed", time.Since(w.sentAt)).
+			Object("frame", msg.Shape).
+			Msg("Response payload decoded to no known fields")
+	}
+	evt := s.client.Logger.Debug()
+	evt.Str("request_message_id", requestID).
+		Str("response_message_id", msg.ResponseID).
+		Stringer("request_action", w.action).
+		Dur("elapsed", time.Since(w.sentAt)).
+		Int("payloadless_frames_before", w.skipped).
+		Object("frame", msg.Shape)
 	if s.client.Logger.GetLevel() == zerolog.TraceLevel {
 		if msg.DecryptedData != nil {
 			evt.Str("data", base64.StdEncoding.EncodeToString(msg.DecryptedData))
 		}
-		if msg.DecryptedMessage != nil {
-			evt.Str("proto_name", string(msg.DecryptedMessage.ProtoReflect().Descriptor().FullName()))
-		}
 	}
 	evt.Msg("Received response")
-	ch <- msg
+	w.ch <- msg
 	return true
 }
 
 func (s *SessionHandler) sendMessageWithParams(params SendMessageParams) (*IncomingRPCMessage, error) {
-	ch, err := s.sendAsyncMessage(params)
+	requestID, ch, err := s.sendAsyncMessageWithID(params)
 	if err != nil {
 		return nil, err
 	}
+	return s.waitForResponse(requestID, ch)
+}
 
+// waitForResponse waits for the request's terminal message: a response, or
+// the payload error that expirePayloadWait delivers.
+func (s *SessionHandler) waitForResponse(requestID string, ch <-chan *IncomingRPCMessage) (*IncomingRPCMessage, error) {
+	var resp *IncomingRPCMessage
 	select {
-	case resp := <-ch:
-		return resp, nil
+	case resp = <-ch:
 	case <-time.After(5 * time.Second):
-		// Notify the pinger in order to trigger an event that the phone isn't responding
-		select {
-		case s.client.pingShortCircuit <- struct{}{}:
-		default:
+		// Notify the pinger in order to trigger an event that the phone isn't
+		// responding - unless the phone already answered this request without
+		// a payload, which proves it is responding.
+		if !s.answeredWithoutPayload(requestID) {
+			select {
+			case s.client.pingShortCircuit <- struct{}{}:
+			default:
+			}
 		}
+		// TODO hard timeout?
+		resp = <-ch
 	}
-	// TODO hard timeout?
-	return <-ch, nil
+	if resp != nil && resp.payloadErr != nil {
+		return nil, resp.payloadErr
+	}
+	return resp, nil
 }
 
 func (s *SessionHandler) sendMessage(actionType gmproto.ActionType, encryptedData proto.Message) (*IncomingRPCMessage, error) {
