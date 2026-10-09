@@ -291,6 +291,13 @@ func (c *Client) postConnect() {
 
 func (c *Client) Disconnect() {
 	c.closeLongPolling()
+	// Fail the requests still waiting for the phone: their responses arrive
+	// over the long-polling connection, so they can never arrive now.
+	// Reconnect doesn't do this, since its new connection can still deliver
+	// them.
+	if failed := c.sessionHandler.failPendingRequests(); failed > 0 {
+		c.Logger.Debug().Int("requests", failed).Msg("Failed pending requests on disconnect")
+	}
 	c.http.CloseIdleConnections()
 }
 

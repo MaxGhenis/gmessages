@@ -22,6 +22,7 @@ type SessionHandler struct {
 	responseWaiters     map[string]*responseWaiter
 	responseWaitersLock sync.Mutex
 	payloadGrace        atomic.Int64 // time.Duration; 0 = DefaultResponsePayloadGrace
+	requestTimeout      atomic.Int64 // time.Duration; 0 = DefaultRequestTimeout
 
 	ackMapLock sync.Mutex
 	ackMap     []string
@@ -54,12 +55,11 @@ func (s *SessionHandler) sendMessageNoResponse(params SendMessageParams) error {
 	return err
 }
 
-func (s *SessionHandler) sendAsyncMessage(params SendMessageParams) (<-chan *IncomingRPCMessage, error) {
-	_, ch, err := s.sendAsyncMessageWithID(params)
-	return ch, err
-}
-
-func (s *SessionHandler) sendAsyncMessageWithID(params SendMessageParams) (string, <-chan *IncomingRPCMessage, error) {
+// sendAsyncMessageWithID sends a request and returns its ID and response
+// channel. A caller that stops waiting before the channel yields must call
+// cancelResponse with both, or the waiter stays registered until the client
+// disconnects.
+func (s *SessionHandler) sendAsyncMessageWithID(params SendMessageParams) (string, chan *IncomingRPCMessage, error) {
 	requestID, payload, err := s.buildMessage(params)
 	if err != nil {
 		return "", nil, err
@@ -113,20 +113,23 @@ func (s *SessionHandler) waitResponse(requestID string, action gmproto.ActionTyp
 	return ch
 }
 
-func (s *SessionHandler) cancelResponse(requestID string, ch chan *IncomingRPCMessage) {
+// cancelResponse removes a still-pending waiter and closes its channel. It
+// returns the waiter it removed, or nil when a response, payload-wait expiry
+// or disconnect claimed the waiter first: that claimer owns the single send
+// on ch (or has closed it), so ch must not be closed here.
+func (s *SessionHandler) cancelResponse(requestID string, ch chan *IncomingRPCMessage) *responseWaiter {
 	s.responseWaitersLock.Lock()
 	defer s.responseWaitersLock.Unlock()
 	w, ok := s.responseWaiters[requestID]
 	if !ok || w.ch != ch {
-		// A response (or payload-wait expiry) already claimed the waiter and
-		// owns the single send on ch, so it must not be closed under it.
-		return
+		return nil
 	}
 	if w.graceTimer != nil {
 		w.graceTimer.Stop()
 	}
 	delete(s.responseWaiters, requestID)
 	close(ch)
+	return w
 }
 
 func (s *SessionHandler) receiveResponse(msg *IncomingRPCMessage) bool {
@@ -162,9 +165,14 @@ func (s *SessionHandler) receiveResponse(msg *IncomingRPCMessage) bool {
 		s.responseWaitersLock.Unlock()
 		if msg.Message.Action != gmproto.ActionType_GET_UPDATES {
 			// A response nobody is waiting for: a late answer after its request
-			// already completed (or failed), or a duplicate.
-			s.client.Logger.Info().
-				Str("request_message_id", requestID).
+			// already completed, failed or timed out, or a duplicate. Late
+			// liveness-ping answers are routine (the pinger stops waiting for a
+			// ping once another one succeeds), so they stay at Debug.
+			evt := s.client.Logger.Info()
+			if msg.Message.Action == gmproto.ActionType_NOTIFY_DITTO_ACTIVITY {
+				evt = s.client.Logger.Debug()
+			}
+			evt.Str("request_message_id", requestID).
 				Str("response_message_id", msg.ResponseID).
 				Object("frame", msg.Shape).
 				Msg("Received response with no pending request")
@@ -233,29 +241,69 @@ func (s *SessionHandler) sendMessageWithParams(params SendMessageParams) (*Incom
 	if err != nil {
 		return nil, err
 	}
-	return s.waitForResponse(requestID, ch)
+	return s.waitForResponse(requestID, params.Action, ch)
 }
 
-// waitForResponse waits for the request's terminal message: a response, or
-// the payload error that expirePayloadWait delivers.
-func (s *SessionHandler) waitForResponse(requestID string, ch <-chan *IncomingRPCMessage) (*IncomingRPCMessage, error) {
-	var resp *IncomingRPCMessage
-	select {
-	case resp = <-ch:
-	case <-time.After(5 * time.Second):
-		// Notify the pinger in order to trigger an event that the phone isn't
-		// responding - unless the phone already answered this request without
-		// a payload, which proves it is responding.
-		if !s.answeredWithoutPayload(requestID) {
-			select {
-			case s.client.pingShortCircuit <- struct{}{}:
-			default:
+// waitForResponse waits for the request's terminal message: a response, the
+// payload error that expirePayloadWait delivers, or the close that a
+// disconnect (failPendingRequests) makes. If none arrives within the request
+// timeout it removes the waiter and fails with ErrPhoneNotResponding.
+func (s *SessionHandler) waitForResponse(requestID string, action gmproto.ActionType, ch chan *IncomingRPCMessage) (*IncomingRPCMessage, error) {
+	start := time.Now()
+	timeout := s.requestTimeoutDuration()
+	nudge := time.NewTimer(phoneNotRespondingNudge)
+	defer nudge.Stop()
+	hard := time.NewTimer(timeout)
+	defer hard.Stop()
+	for {
+		select {
+		case resp, ok := <-ch:
+			return terminalResponse(resp, ok, action, start)
+		case <-nudge.C:
+			// Notify the pinger in order to trigger an event that the phone isn't
+			// responding - unless the phone already answered this request without
+			// a payload, which proves it is responding.
+			if !s.answeredWithoutPayload(requestID) {
+				select {
+				case s.client.pingShortCircuit <- struct{}{}:
+				default:
+				}
 			}
+		case <-hard.C:
+			return s.abandonRequest(requestID, action, ch, timeout, start)
 		}
-		// TODO hard timeout?
-		resp = <-ch
 	}
-	if resp != nil && resp.payloadErr != nil {
+}
+
+// abandonRequest ends a wait whose timeout passed: it removes the waiter and
+// fails the request with ErrPhoneNotResponding (or the payload error, if the
+// phone answered without one). If a response, payload-wait expiry or
+// disconnect claimed the waiter first, that outcome is already on its way
+// down ch and is returned instead.
+func (s *SessionHandler) abandonRequest(requestID string, action gmproto.ActionType, ch chan *IncomingRPCMessage, timeout time.Duration, start time.Time) (*IncomingRPCMessage, error) {
+	w := s.cancelResponse(requestID, ch)
+	if w == nil {
+		resp, ok := <-ch
+		return terminalResponse(resp, ok, action, start)
+	}
+	err := w.timeoutError(timeout)
+	s.client.Logger.Warn().
+		Str("request_message_id", requestID).
+		Stringer("request_action", action).
+		Dur("timeout", timeout).
+		Int("payloadless_frames", w.skipped).
+		Err(err).
+		Msg("Phone did not answer the request in time; giving up on it")
+	return nil, err
+}
+
+// terminalResponse turns what a waiter's channel yielded into the caller's
+// result. A closed channel means the waiter was failed without a response.
+func terminalResponse(resp *IncomingRPCMessage, ok bool, action gmproto.ActionType, start time.Time) (*IncomingRPCMessage, error) {
+	if !ok || resp == nil {
+		return nil, &UnansweredRequestError{Action: action, Reason: ErrConnectionClosed, Waited: time.Since(start)}
+	}
+	if resp.payloadErr != nil {
 		return nil, resp.payloadErr
 	}
 	return resp, nil
