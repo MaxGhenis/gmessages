@@ -111,6 +111,17 @@ func (dp *dittoPinger) OnTimeout(pingID uint64, sendNotResponding bool) {
 	}
 }
 
+// onPingChannel handles a receive from a ping's response channel. A closed
+// channel is not an answer: the client disconnected (failPendingRequests) or
+// the ping was abandoned, so it must not report the phone as responding.
+func (dp *dittoPinger) onPingChannel(pingID uint64, start time.Time, answered bool, reset *resetter) {
+	if !answered {
+		dp.log.Debug().Uint64("ping_id", pingID).Msg("Ditto ping abandoned before the phone answered")
+		return
+	}
+	dp.OnRespond(pingID, time.Since(start), reset)
+}
+
 func (dp *dittoPinger) WaitForResponse(pingID uint64, start time.Time, timeout time.Duration, timeoutCount int, pingChan <-chan *IncomingRPCMessage, reset *resetter) {
 	var timerChan <-chan time.Time
 	var timer *time.Timer
@@ -119,8 +130,8 @@ func (dp *dittoPinger) WaitForResponse(pingID uint64, start time.Time, timeout t
 		timerChan = timer.C
 	}
 	select {
-	case <-pingChan:
-		dp.OnRespond(pingID, time.Since(start), reset)
+	case _, ok := <-pingChan:
+		dp.onPingChannel(pingID, start, ok, reset)
 		if timer != nil && !timer.Stop() {
 			<-timer.C
 		}
@@ -136,8 +147,8 @@ func (dp *dittoPinger) WaitForResponse(pingID uint64, start time.Time, timeout t
 		for {
 			timeoutCount++
 			select {
-			case <-pingChan:
-				dp.OnRespond(pingID, time.Since(start), reset)
+			case _, ok := <-pingChan:
+				dp.onPingChannel(pingID, start, ok, reset)
 				return
 			case <-repingTickerChan:
 				if repingTickerTime < maxRepingTickerTime {
@@ -198,7 +209,7 @@ func (dp *dittoPinger) Ping(pingID uint64, timeout time.Duration, timeoutCount i
 	if dp.oldestPingTime.IsZero() {
 		dp.oldestPingTime = now
 	}
-	pingChan, err := dp.client.NotifyDittoActivity()
+	requestID, pingChan, err := dp.client.notifyDittoActivity()
 	if err != nil {
 		dp.log.Err(err).Uint64("ping_id", pingID).Msg("Error sending ping")
 		dp.pingFails++
@@ -210,10 +221,16 @@ func (dp *dittoPinger) Ping(pingID uint64, timeout time.Duration, timeoutCount i
 		return
 	}
 	dp.pingHandlingLock.Unlock()
-	if timeoutCount == 0 {
+	wait := func() {
 		dp.WaitForResponse(pingID, now, timeout, timeoutCount, pingChan, reset)
+		// Nobody reads pingChan after this, so drop a still-pending waiter
+		// rather than keep it registered until the next disconnect.
+		dp.client.sessionHandler.cancelResponse(requestID, pingChan)
+	}
+	if timeoutCount == 0 {
+		wait()
 	} else {
-		go dp.WaitForResponse(pingID, now, timeout, timeoutCount, pingChan, reset)
+		go wait()
 	}
 }
 
