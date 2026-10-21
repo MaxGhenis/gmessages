@@ -155,8 +155,15 @@ func (c *Client) IsBugleDefault() (*gmproto.IsBugleDefaultResponse, error) {
 	return typedResponse[*gmproto.IsBugleDefaultResponse](c.sessionHandler.sendMessage(actionType, nil))
 }
 
+// NotifyDittoActivity sends a liveness ping. The returned channel yields the
+// phone's answer, or is closed without one if the client disconnects first.
 func (c *Client) NotifyDittoActivity() (<-chan *IncomingRPCMessage, error) {
-	return c.sessionHandler.sendAsyncMessage(SendMessageParams{
+	_, ch, err := c.notifyDittoActivity()
+	return ch, err
+}
+
+func (c *Client) notifyDittoActivity() (string, chan *IncomingRPCMessage, error) {
+	return c.sessionHandler.sendAsyncMessageWithID(SendMessageParams{
 		Action: gmproto.ActionType_NOTIFY_DITTO_ACTIVITY,
 		Data:   &gmproto.NotifyDittoActivityRequest{Success: true},
 	})

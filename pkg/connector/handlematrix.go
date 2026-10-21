@@ -31,6 +31,7 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
 	"go.mau.fi/mautrix-gmessages/pkg/libgm/util"
 )
@@ -68,6 +69,16 @@ func (gc *GMClient) HandleMatrixMessage(ctx context.Context, msg *bridgev2.Matri
 		Msg("Sending Matrix message to Google Messages")
 	resp, err := gc.Client.SendMessage(req)
 	if err != nil {
+		if errors.Is(err, libgm.ErrPhoneNotResponding) {
+			// The server accepted the message, so the phone may still send it whenever
+			// it comes back online. Keep the pending entry so the remote echo can
+			// resolve the original event (and correct the failure status) if that happens.
+			// Same handling as upstream c0a2d38.
+			return nil, bridgev2.WrapErrorInStatus(err).
+				WithMessage(PhoneNotRespondingMessage).
+				WithErrorReason(event.MessageStatusTooOld).
+				WithSendNotice(true)
+		}
 		msg.RemovePending(txnID)
 		return nil, err
 	} else if resp.Status != gmproto.SendMessageResponse_SUCCESS {

@@ -111,8 +111,6 @@ type result struct {
 	err  error
 }
 
-// await registers a waiter like sendMessageWithParams does and returns a
-// channel with the caller-visible result.
 // await registers a waiter and waits for it through the same
 // waitForResponse that sendMessageWithParams uses, so the error hand-off from
 // expirePayloadWait is exercised exactly as callers see it.
@@ -120,7 +118,7 @@ func await(cli *Client, requestID string, action gmproto.ActionType) <-chan resu
 	ch := cli.sessionHandler.waitResponse(requestID, action)
 	out := make(chan result, 1)
 	go func() {
-		resp, err := cli.sessionHandler.waitForResponse(requestID, ch)
+		resp, err := cli.sessionHandler.waitForResponse(requestID, action, ch)
 		out <- result{resp: resp, err: err}
 	}()
 	return out

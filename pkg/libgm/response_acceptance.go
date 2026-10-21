@@ -240,13 +240,7 @@ func (s *SessionHandler) expirePayloadWait(requestID string, w *responseWaiter) 
 		return
 	}
 	delete(s.responseWaiters, requestID)
-	err := &ResponsePayloadError{
-		Action:        w.action,
-		Frames:        w.skipped,
-		Shape:         w.lastSkipped,
-		AccountSwitch: w.accountSwitch,
-		Waited:        time.Since(w.sentAt),
-	}
+	err := w.payloadError()
 	s.responseWaitersLock.Unlock()
 	s.client.Logger.Warn().
 		Str("request_message_id", requestID).
@@ -257,6 +251,19 @@ func (s *SessionHandler) expirePayloadWait(requestID string, w *responseWaiter) 
 		Object("last_frame", w.lastSkipped).
 		Msg("Phone never sent a response payload; failing the request instead of returning an empty response")
 	w.ch <- &IncomingRPCMessage{payloadErr: err}
+}
+
+// payloadError describes a request answered only by payload-less frames. The
+// caller must own w: hold responseWaitersLock, or have removed w from the
+// waiter map under it.
+func (w *responseWaiter) payloadError() *ResponsePayloadError {
+	return &ResponsePayloadError{
+		Action:        w.action,
+		Frames:        w.skipped,
+		Shape:         w.lastSkipped,
+		AccountSwitch: w.accountSwitch,
+		Waited:        time.Since(w.sentAt),
+	}
 }
 
 // answeredWithoutPayload reports whether a still-pending request has already

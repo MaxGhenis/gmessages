@@ -507,7 +507,7 @@ func (c *Client) sendGaiaPairingMessage(ctx context.Context, sess *PairingSessio
 		reqContainer.ProposedVerificationCodeVersion = 1
 		reqContainer.ProposedKeyDerivationVersion = 1
 	}
-	respCh, err := c.sessionHandler.sendAsyncMessage(SendMessageParams{
+	requestID, respCh, err := c.sessionHandler.sendAsyncMessageWithID(SendMessageParams{
 		Action:      action,
 		Data:        reqContainer,
 		DontEncrypt: true,
@@ -518,7 +518,10 @@ func (c *Client) sendGaiaPairingMessage(ctx context.Context, sess *PairingSessio
 		return nil, err
 	}
 	select {
-	case resp := <-respCh:
+	case resp, ok := <-respCh:
+		if !ok {
+			return nil, ErrConnectionClosed
+		}
 		var respDat gmproto.GaiaPairingResponseContainer
 		err = proto.Unmarshal(resp.Message.UnencryptedData, &respDat)
 		if err != nil {
@@ -526,6 +529,7 @@ func (c *Client) sendGaiaPairingMessage(ctx context.Context, sess *PairingSessio
 		}
 		return &respDat, nil
 	case <-ctx.Done():
+		c.sessionHandler.cancelResponse(requestID, respCh)
 		return nil, ctx.Err()
 	}
 }
